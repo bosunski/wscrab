@@ -1,5 +1,19 @@
 use std::io::Write;
 use clap::{Command, Parser, error::ErrorKind, CommandFactory};
+use regex::Regex;
+use colored::*;
+use websocket::sender::Sender;
+use websocket::ws::dataframe::DataFrame;
+
+use std::io::stdin;
+use std::sync::mpsc::{channel, Sender as ChannelSender};
+use std::thread;
+
+use websocket::client::ClientBuilder;
+use websocket::{Message, OwnedMessage};
+
+use rustyline::error::ReadlineError;
+use rustyline::{Editor, Result as LineResult};
 
 /// Just another port of wscat to Rust
 #[derive(Parser, Debug)]
@@ -10,52 +24,171 @@ struct Args {
    connect: Option<String>,
 }
 
-fn main() -> Result<(), String> {
+fn main() -> LineResult<()> {
     let args = Args::parse();
 
-    if !args.connect.is_none() {
-        // println!("Connection URL is {}!", args.connect.unwrap());
-    }
-
     let mut cmd = Args::command();
-    let url = args.connect.as_deref().unwrap();
+    let url = String::from(args.connect.as_deref().unwrap());
+    let re = Regex::new(r"^\w+://.*$").unwrap();
+
+    let mut modified_url = String::from("ws://");
+    modified_url.push_str(&url);
+
+    let url = if re.is_match(&url) {url} else {
+        modified_url
+    };
+
     println!("Connection URL is {}!", url);
 
     if ! url.starts_with("ws") {
         cmd.error(ErrorKind::InvalidValue, "The URL must start with ws:// or wss://").exit();
     }
 
+    println!("Connecting to {}", url);
 
-    match start() {
-        Ok(r) => {
-            Ok(r)
-        }
-        Err(err) => {
-            Err(err)
-        }
-    }
-}
+	let client = ClientBuilder::new(&url)
+		.unwrap()
+		.connect_insecure()
+		.unwrap();
 
-fn start() -> Result<(), String>{
+	println!("{}", "Connected (press CTRL+C to quit)".green());
+
+	let (mut receiver, mut sender) = client.split().unwrap();
+
+	let (tx, rx) = channel();
+
+	let tx_1 = tx.clone();
+
+	let send_loop = thread::spawn(move || {
+		loop {
+			// Send loop
+			let message = match rx.recv() {
+				Ok(m) => m,
+				Err(e) => {
+					println!("Send Loop: {:?}", e);
+					return;
+				}
+			};
+			match message {
+				OwnedMessage::Close(_) => {
+					let _ = sender.send_message(&message);
+					// If it's a close message, just send it and then return.
+					return;
+				}
+				_ => (),
+			}
+			// Send the message
+			match sender.send_message(&message) {
+				Ok(()) => (),
+				Err(e) => {
+					println!("Send Loop: {:?}", e);
+					let _ = sender.send_message(&Message::close());
+					return;
+				}
+			}
+		}
+	});
+
+	let receive_loop = thread::spawn(move || {
+		// Receive loop
+		for message in receiver.incoming_messages() {
+			let message = match message {
+				Ok(m) => m,
+				Err(e) => {
+					println!("Receive Loop: {:?}", e);
+					let _ = tx_1.send(OwnedMessage::Close(None));
+					return;
+				}
+			};
+			match message {
+				OwnedMessage::Close(_) => {
+					// Got a close message, so send a close message and return
+					let _ = tx_1.send(OwnedMessage::Close(None));
+					return;
+				}
+				OwnedMessage::Ping(data) => {
+					match tx_1.send(OwnedMessage::Pong(data)) {
+						// Send a pong in response
+						Ok(()) => (),
+						Err(e) => {
+							println!("Receive Loop: {:?}", e);
+							return;
+						}
+					}
+				}
+				// Say what we received
+				_ => {
+                    match message {
+                        OwnedMessage::Text(txt) => {
+                            println!("{} {}", "<".blue(), txt.blue());
+                        },
+                        _ => println!("< {:?}", message)
+                    }
+                },
+			}
+		}
+	});
+
+    let mut rl = Editor::<()>::new()?;
+
     loop {
-        let line = readline()?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+        print!("\r\u{001b}[2K\u{001b}[3D");
+        let line: LineResult<String> = rl.readline(">> ");
 
-        match respond(line) {
-            Ok(quit) => {
-                if quit {
-                    break;
+        match line {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
                 }
-            }
+
+                rl.add_history_entry(line);
+                // println!("Line: {}", line);
+
+                let message = match line {
+                    "/close" => {
+                        // Close the connection
+                        let _ = tx.send(OwnedMessage::Close(None));
+                        break;
+                    }
+                    // Send a ping
+                    "/ping" => OwnedMessage::Ping(b"PING".to_vec()),
+                    // Otherwise, just send text
+                    _ => OwnedMessage::Text(line.to_string()),
+                };
+        
+                match tx.send(message) {
+                    Ok(()) => (),
+                    Err(e) => {
+                        println!("Main Loop: {:?}", e);
+                        break;
+                    }
+                }
+            },
+            Err(ReadlineError::Interrupted) => {
+                println!("CTRL-C");
+                break
+            },
+            Err(ReadlineError::Eof) => {
+                println!("CTRL-D");
+                break
+            },
             Err(err) => {
-                write!(std::io::stdout(), "{}", err).map_err(|e| e.to_string())?;
-                std::io::stdout().flush().map_err(|e| e.to_string())?;
+                println!("Error: {:?}", err);
+                break
             }
         }
     }
+
+    tx.send(OwnedMessage::Close(None)).expect("Unable to close connection.");
+
+    // We're exiting
+	println!("Waiting for child threads to exit");
+
+	let _ = send_loop.join();
+	let _ = receive_loop.join();
+
+	println!("Exited");
 
     Ok(())
 }
@@ -116,7 +249,7 @@ fn cli() -> Command {
 }
 
 fn readline() -> Result<String, String> {
-    write!(std::io::stdout(), ">>> ").map_err(|e| e.to_string())?;
+    write!(std::io::stdout(), "> ").map_err(|e| e.to_string())?;
     std::io::stdout().flush().map_err(|e| e.to_string())?;
     let mut buffer = String::new();
     std::io::stdin()
