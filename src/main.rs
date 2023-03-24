@@ -52,42 +52,11 @@ async fn read_line(tx: UnboundedSender<Message>, mut rl: Readline, mut stdout: S
 
     loop {
         futures::select! {
-			// _ = periodic_timer1.tick().fuse() => {
-			// 	if running_first { writeln!(stdout, "First timer went off!")?; }
-			// }
-			// _ = periodic_timer2.tick().fuse() => {
-			// 	if running_second { log::info!("Second timer went off!"); }
-			// }
 			command = rl.readline().fuse() => match command {
 				Ok(line) => {
 					let line = line.trim();
 					rl.add_history_entry(line.to_owned());
-					// tx.unbounded_send(Message::Text(line.to_string())).unwrap();
-
                     match line {
-						"start task" => {
-							writeln!(stdout, "Starting the task...")?;
-							running_first = true;
-						},
-						"stop task" => {
-							writeln!(stdout, "Stopping the task...")?;
-							running_first = false;
-						}
-						"start logging" => {
-							log::info!("Starting the logger...");
-							running_second = true
-						},
-						"stop logging" => {
-							log::info!("Stopping the logger...");
-							running_second = false
-						},
-						"info" => {
-							writeln!(stdout, r"
-hello there
-I use NixOS btw
-its pretty cool
-							")?;
-						}
 						_ => {
 							tx.unbounded_send(Message::Text(line.to_string())).unwrap();
 						},
@@ -105,5 +74,6 @@ its pretty cool
 		}
     }
 
+	rl.flush()?;
     Ok(())
 }
