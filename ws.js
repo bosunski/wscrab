@@ -1,0 +1,18 @@
+const { WebSocketServer } = require('ws');
+
+const port = 8080;
+
+const wss = new WebSocketServer({ port }, () => {
+    console.log(`Listening on port ${port}...`)
+});
+
+wss.on('connection', function connection(ws) {
+  ws.on('error', console.error);
+
+  ws.on('message', (something) =>  {
+    console.log('Received: %s', something);
+    ws.send(`You said: ${something}`);
+  });
+
+  ws.send('Connected!');
+});
