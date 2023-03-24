@@ -1,259 +1,109 @@
-use std::io::Write;
-use clap::{Command, Parser, error::ErrorKind, CommandFactory};
-use regex::Regex;
+use rustyline_async::{Readline, ReadlineError, SharedWriter};
+
+use std::{io::Write, time::Duration};
+
+use futures::{prelude::*, join};
+use futures::channel::mpsc::{self as futures_channel, UnboundedSender};
+use tokio::time::{self};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use colored::*;
-use websocket::sender::Sender;
-use websocket::ws::dataframe::DataFrame;
 
-use std::io::stdin;
-use std::sync::mpsc::{channel, Sender as ChannelSender};
-use std::thread;
+const CONNECTION: &'static str = "ws://127.0.0.1:8080";
 
-use websocket::client::ClientBuilder;
-use websocket::{Message, OwnedMessage};
+#[tokio::main]
+async fn main() -> Result<(), ReadlineError> {
+    let (rl, stdout) = Readline::new(">> ".to_owned()).unwrap();
+    let (stdin_tx, stdin_rx) = futures_channel::unbounded();
 
-use rustyline::error::ReadlineError;
-use rustyline::{Editor, Result as LineResult};
+    simplelog::WriteLogger::init(
+        log::LevelFilter::Debug,
+        simplelog::Config::default(),
+        stdout.clone(),
+    )
+        .unwrap();
 
-/// Just another port of wscat to Rust
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None, arg_required_else_help = true)]
-struct Args {
-   /// WebSocket URL to connect to
-   #[arg(short, long)]
-   connect: Option<String>,
-}
+    let url = url::Url::parse(CONNECTION).unwrap();
+    let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
+    writeln!(stdout.clone(), "{}", "Connected (press CTRL+C to quit)".green()).expect("TODO: panic message");
 
-fn main() -> LineResult<()> {
-    let args = Args::parse();
-
-    let mut cmd = Args::command();
-    let url = String::from(args.connect.as_deref().unwrap());
-    let re = Regex::new(r"^\w+://.*$").unwrap();
-
-    let mut modified_url = String::from("ws://");
-    modified_url.push_str(&url);
-
-    let url = if re.is_match(&url) {url} else {
-        modified_url
+	let (writer, mut read) = ws_stream.split();
+    let receiver_task = stdin_rx.map(Ok).forward(writer);
+    let print_task = async {
+        while let Some(message) = read.next().await {
+            let mut stdout = stdout.clone();
+            writeln!(stdout, "{} {}", "<<".blue(), message.unwrap().to_string().blue()).unwrap();
+        }
     };
 
-    println!("Connection URL is {}!", url);
+    join!(print_task, receiver_task, read_line(stdin_tx, rl, stdout.clone()));
 
-    if ! url.starts_with("ws") {
-        cmd.error(ErrorKind::InvalidValue, "The URL must start with ws:// or wss://").exit();
-    }
-
-    println!("Connecting to {}", url);
-
-	let client = ClientBuilder::new(&url)
-		.unwrap()
-		.connect_insecure()
-		.unwrap();
-
-	println!("{}", "Connected (press CTRL+C to quit)".green());
-
-	let (mut receiver, mut sender) = client.split().unwrap();
-
-	let (tx, rx) = channel();
-
-	let tx_1 = tx.clone();
-
-	let send_loop = thread::spawn(move || {
-		loop {
-			// Send loop
-			let message = match rx.recv() {
-				Ok(m) => m,
-				Err(e) => {
-					println!("Send Loop: {:?}", e);
-					return;
-				}
-			};
-			match message {
-				OwnedMessage::Close(_) => {
-					let _ = sender.send_message(&message);
-					// If it's a close message, just send it and then return.
-					return;
-				}
-				_ => (),
-			}
-			// Send the message
-			match sender.send_message(&message) {
-				Ok(()) => (),
-				Err(e) => {
-					println!("Send Loop: {:?}", e);
-					let _ = sender.send_message(&Message::close());
-					return;
-				}
-			}
-		}
-	});
-
-	let receive_loop = thread::spawn(move || {
-		// Receive loop
-		for message in receiver.incoming_messages() {
-			let message = match message {
-				Ok(m) => m,
-				Err(e) => {
-					println!("Receive Loop: {:?}", e);
-					let _ = tx_1.send(OwnedMessage::Close(None));
-					return;
-				}
-			};
-			match message {
-				OwnedMessage::Close(_) => {
-					// Got a close message, so send a close message and return
-					let _ = tx_1.send(OwnedMessage::Close(None));
-					return;
-				}
-				OwnedMessage::Ping(data) => {
-					match tx_1.send(OwnedMessage::Pong(data)) {
-						// Send a pong in response
-						Ok(()) => (),
-						Err(e) => {
-							println!("Receive Loop: {:?}", e);
-							return;
-						}
-					}
-				}
-				// Say what we received
-				_ => {
-                    match message {
-                        OwnedMessage::Text(txt) => {
-                            println!("{} {}", "<".blue(), txt.blue());
-                        },
-                        _ => println!("< {:?}", message)
-                    }
-                },
-			}
-		}
-	});
-
-    let mut rl = Editor::<()>::new()?;
-
-    loop {
-        print!("\r\u{001b}[2K\u{001b}[3D");
-        let line: LineResult<String> = rl.readline(">> ");
-
-        match line {
-            Ok(line) => {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-
-                rl.add_history_entry(line);
-                // println!("Line: {}", line);
-
-                let message = match line {
-                    "/close" => {
-                        // Close the connection
-                        let _ = tx.send(OwnedMessage::Close(None));
-                        break;
-                    }
-                    // Send a ping
-                    "/ping" => OwnedMessage::Ping(b"PING".to_vec()),
-                    // Otherwise, just send text
-                    _ => OwnedMessage::Text(line.to_string()),
-                };
-        
-                match tx.send(message) {
-                    Ok(()) => (),
-                    Err(e) => {
-                        println!("Main Loop: {:?}", e);
-                        break;
-                    }
-                }
-            },
-            Err(ReadlineError::Interrupted) => {
-                println!("CTRL-C");
-                break
-            },
-            Err(ReadlineError::Eof) => {
-                println!("CTRL-D");
-                break
-            },
-            Err(err) => {
-                println!("Error: {:?}", err);
-                break
-            }
-        }
-    }
-
-    tx.send(OwnedMessage::Close(None)).expect("Unable to close connection.");
-
-    // We're exiting
-	println!("Waiting for child threads to exit");
-
-	let _ = send_loop.join();
-	let _ = receive_loop.join();
-
-	println!("Exited");
+    // Flush all writers to stdout
+    // rl.flush()?;
 
     Ok(())
 }
 
-fn respond(line: &str) -> Result<bool, String> {
-    let args = shlex::split(line).ok_or("error: Invalid quoting")?;
-    let matches = cli()
-        .try_get_matches_from(args)
-        .map_err(|e| e.to_string())?;
-    match matches.subcommand() {
-        Some(("ping", _matches)) => {
-            writeln!(std::io::stdout(), "Pong").map_err(|e| e.to_string())?;
-            std::io::stdout().flush().map_err(|e| e.to_string())?;
-        }
-        Some(("quit", _matches)) => {
-            writeln!(std::io::stdout(), "Exiting ...").map_err(|e| e.to_string())?;
-            std::io::stdout().flush().map_err(|e| e.to_string())?;
-            return Ok(true);
-        }
-        Some((name, _matches)) => unimplemented!("{}", name),
-        None => unreachable!("subcommand required"),
+async fn read_line(tx: UnboundedSender<Message>, mut rl: Readline, mut stdout: SharedWriter) -> Result<(), ReadlineError> {
+    let mut periodic_timer1 = time::interval(Duration::from_secs(2));
+    let mut periodic_timer2 = time::interval(Duration::from_secs(3));
+
+    let mut running_first = true;
+    let mut running_second = false;
+
+    loop {
+        futures::select! {
+			// _ = periodic_timer1.tick().fuse() => {
+			// 	if running_first { writeln!(stdout, "First timer went off!")?; }
+			// }
+			// _ = periodic_timer2.tick().fuse() => {
+			// 	if running_second { log::info!("Second timer went off!"); }
+			// }
+			command = rl.readline().fuse() => match command {
+				Ok(line) => {
+					let line = line.trim();
+					rl.add_history_entry(line.to_owned());
+					// tx.unbounded_send(Message::Text(line.to_string())).unwrap();
+
+                    match line {
+						"start task" => {
+							writeln!(stdout, "Starting the task...")?;
+							running_first = true;
+						},
+						"stop task" => {
+							writeln!(stdout, "Stopping the task...")?;
+							running_first = false;
+						}
+						"start logging" => {
+							log::info!("Starting the logger...");
+							running_second = true
+						},
+						"stop logging" => {
+							log::info!("Stopping the logger...");
+							running_second = false
+						},
+						"info" => {
+							writeln!(stdout, r"
+hello there
+I use NixOS btw
+its pretty cool
+							")?;
+						}
+						_ => {
+							tx.unbounded_send(Message::Text(line.to_string())).unwrap();
+						},
+					}
+				},
+				Err(ReadlineError::Eof) => { writeln!(stdout, "Exiting...")?; break },
+				Err(ReadlineError::Interrupted) => { writeln!(stdout, "^C")?; break },
+				// Err(ReadlineError::Closed) => break, // Readline was closed via one way or another, cleanup other futures here and break out of the loop
+				Err(err) => {
+					writeln!(stdout, "Received err: {:?}", err)?;
+					writeln!(stdout, "Exiting...")?;
+					break
+				},
+			}
+		}
     }
 
-    Ok(false)
-}
-
-fn cli() -> Command {
-    // strip out usage
-    const PARSER_TEMPLATE: &str = "\
-        {all-args}
-    ";
-    // strip out name/version
-    const APPLET_TEMPLATE: &str = "\
-        {about-with-newline}\n\
-        {usage-heading}\n    {usage}\n\
-        \n\
-        {all-args}{after-help}\
-    ";
-
-    Command::new("repl")
-        .multicall(true)
-        .arg_required_else_help(true)
-        .subcommand_required(true)
-        .subcommand_value_name("APPLET")
-        .subcommand_help_heading("APPLETS")
-        .help_template(PARSER_TEMPLATE)
-        .subcommand(
-            Command::new("ping")
-                .about("Get a response")
-                .help_template(APPLET_TEMPLATE),
-        )
-        .subcommand(
-            Command::new("quit")
-                .alias("exit")
-                .about("Quit the REPL")
-                .help_template(APPLET_TEMPLATE),
-        )
-}
-
-fn readline() -> Result<String, String> {
-    write!(std::io::stdout(), "> ").map_err(|e| e.to_string())?;
-    std::io::stdout().flush().map_err(|e| e.to_string())?;
-    let mut buffer = String::new();
-    std::io::stdin()
-        .read_line(&mut buffer)
-        .map_err(|e| e.to_string())?;
-    Ok(buffer)
+    Ok(())
 }
