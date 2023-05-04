@@ -1,4 +1,7 @@
 use crate::builder::Config;
+use base64::Engine;
+use base64::{engine::{general_purpose}};
+
 use rustyline_async::{Readline, ReadlineError, SharedWriter};
 
 use std::io::Write;
@@ -13,9 +16,11 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 
 
-#[derive(Debug, PartialEq)]
 pub struct App {
     pub config: Config,
+    tx: Option<UnboundedSender<Message>>,
+    stdout: Option<SharedWriter>,
+    rl: Option<Readline>
 }
 
 #[derive(Default)]
@@ -28,7 +33,7 @@ impl App {
         AppBuilder::default()
     }
 
-    pub async fn run(&self) -> Result<(), ReadlineError> {
+    pub async fn run(&mut self) -> Result<(), ReadlineError> {
         let (rl, stdout) = Readline::new(">> ".to_owned()).unwrap();
         let (stdin_tx, stdin_rx) = futures_channel::unbounded();
 
@@ -45,7 +50,11 @@ impl App {
             }
         };
 
-        _ = join!(print_task, receiver_task, self.read_line(stdin_tx, rl, stdout.clone()));
+        self.tx = Some(stdin_tx);
+        self.stdout = Some(stdout.clone());
+        self.rl = Some(rl);
+
+        _ = join!(print_task, receiver_task, self.read_line());
 
         Ok(())
     }
@@ -55,11 +64,10 @@ impl App {
 
        let mut key = [0u8; 16];
        OsRng.fill_bytes(&mut key);
-
-       let key = base64::encode(key);
+       let key = general_purpose::STANDARD.encode(key);
 
        // Set headers required for WebSocket handshake
-       return Request::builder()
+       let mut request = Request::builder()
            .method("GET")
            .uri(url.as_str())
            .version(http::Version::HTTP_11)
@@ -67,22 +75,38 @@ impl App {
            .header(header::HOST, url.host_str().unwrap().clone())
            .header(header::UPGRADE, "websocket")
            .header(header::SEC_WEBSOCKET_VERSION, "13")
-           .header(header::SEC_WEBSOCKET_KEY, key)
-           .body(())
-           .unwrap();
+           .header(header::SEC_WEBSOCKET_KEY, key);
+
+        if (self.config.auth).is_some() {
+            let token = general_purpose::STANDARD.encode(self.config.auth.as_ref().unwrap());
+            let mut auth_header = String::from("Basic ");
+            auth_header.push_str(&token);
+
+            request = request.header(header::AUTHORIZATION, auth_header);
+        }
+
+        return request.body(()).unwrap();
     }
 
-    async fn read_line(&self, tx: UnboundedSender<Message>, mut rl: Readline, mut stdout: SharedWriter) -> Result<(), ReadlineError> {
+    async fn read_line(&mut self) -> Result<(), ReadlineError> {
+        let rl = self.rl.as_mut().unwrap();
+        let stdout = self.stdout.as_mut().unwrap();
         loop {
             futures::select! {
                 command = rl.readline().fuse() => match command {
                     Ok(line) => {
                         let line = line.trim();
                         rl.add_history_entry(line.to_owned());
-                        match line {
-                            _ => {
-                                tx.unbounded_send(Message::Text(line.to_string())).unwrap();
+                        match line.starts_with("/") {
+                            true => {
+                                let mut message = String::from("Received command: ");
+                                message.push_str(&line);
+                                writeln!(stdout, "{}", message.yellow())?;
+                                self.handle_slash_command(String::from(line))
                             },
+                            false => {
+                                self.tx.as_ref().unwrap().unbounded_send(Message::Text(line.to_string())).unwrap()
+                            }
                         }
                     },
                     Err(ReadlineError::Eof) => { writeln!(stdout, "Exiting...")?; break },
@@ -100,20 +124,25 @@ impl App {
         rl.flush()?;
         Ok(())
     }
+
+    fn handle_slash_command(self, command: String) {
+        //
+    }
 }
 
 impl AppBuilder {
-    pub fn new() -> AppBuilder {
-        AppBuilder { config: None }
-    }
-
     pub fn configure(mut self, config: Config) -> AppBuilder {
         self.config = Some(config);
         self
     }
 
     pub fn build(self) -> App {
-        App { config: self.config.expect("Config must be set to create app instance") }
+        App {
+            config: self.config.expect("Config must be set to create app instance"),
+            tx: None,
+            stdout: None,
+            rl: None,
+        }
     }
 }
 

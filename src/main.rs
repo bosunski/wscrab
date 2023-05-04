@@ -2,7 +2,6 @@ use app::App;
 use builder::Config;
 use clap::{Parser, error::ErrorKind, CommandFactory};
 use regex::Regex;
-use futures::join;
 
 mod builder;
 mod app;
@@ -10,7 +9,7 @@ mod app;
 /// Just another port of wscat to Rust
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, arg_required_else_help = true)]
-struct Args {
+struct Configs {
    #[arg(long, value_name = "username:password", help = "add basic HTTP authentication header (--connect only)")]
    auth: Option<String>,
 
@@ -74,8 +73,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
-    let mut cmd = Args::command();
+    let args = Configs::parse();
+    let mut cmd = Configs::command();
 
     let url = String::from(args.connect.as_deref().unwrap());
     let re = Regex::new(r"^\w+://.*$").unwrap();
@@ -91,8 +90,8 @@ async fn main() {
         cmd.error(ErrorKind::InvalidValue, "The URL must start with ws:// or wss://").exit();
     }
 
-    let config: Config = Config::builder().connect(url).build();
-    let app: App = App::builder().configure(config).build();
+    let config: Config = Config::builder().auth(args.auth).connect(url).build();
+    let mut app: App = App::builder().configure(config).build();
 
-    _ = join!(app.run());
+    _ = app.run().await;
 }

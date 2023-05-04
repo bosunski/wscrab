@@ -1,6 +1,6 @@
 #[derive(Debug, PartialEq)]
 pub struct Config {
-   auth: Option<String>,
+   pub auth: Option<String>,
    ca: Option<String>,
    cert: Option<String>,
    host: Option<String>,
@@ -53,33 +53,38 @@ pub struct ConfigBuilder {
 }
 
 impl ConfigBuilder {
-    pub fn new(/* ... */) -> ConfigBuilder {
-        ConfigBuilder {
-            auth: None,
-            ca: None,
-            cert: None,
-            host: None,
-            key: None,
-            max_redirects: None,
-            no_color: None,
-            passphrase: None,
-            proxy: None,
-            slash: None,
-            connect: None,
-            header: None,
-            location: None,
-            listen: None,
-            no_check: None,
-            protocol: None,
-            show_ping_pong: None,
-            subprotocol: None,
-            wait: None,
-            execute: None,
-        }
-    }
+    // pub fn new(/* ... */) -> ConfigBuilder {
+    //     ConfigBuilder {
+    //         auth: None,
+    //         ca: None,
+    //         cert: None,
+    //         host: None,
+    //         key: None,
+    //         max_redirects: None,
+    //         no_color: None,
+    //         passphrase: None,
+    //         proxy: None,
+    //         slash: None,
+    //         connect: None,
+    //         header: None,
+    //         location: None,
+    //         listen: None,
+    //         no_check: None,
+    //         protocol: None,
+    //         show_ping_pong: None,
+    //         subprotocol: None,
+    //         wait: None,
+    //         execute: None,
+    //     }
+    // }
 
     pub fn connect(mut self, url: String) -> ConfigBuilder {
         self.connect = Some(url);
+        self
+    }
+
+    pub fn auth(mut self, auth: Option<String>) -> ConfigBuilder {
+        self.auth = auth;
         self
     }
 
